@@ -9,7 +9,7 @@ app = Flask(__name__)
 # Initialize Firebase
 cred = firebase_admin.credentials.Certificate('firebasekey.json')
 firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://botify-409-default-rtdb.firebaseio.com/'  # Replace with your URL
+    'databaseURL': 'https://botify-409-default-rtdb.firebaseio.com/'  # Verify this URL
 })
 ref = db.reference('bots')
 
@@ -26,7 +26,6 @@ async def handle_telegram_update(update):
         bots = ref.get()
 
         if bots:
-            # Make sure we always have a list of bot dicts
             if isinstance(bots, dict):
                 bot_list = bots.values()
             elif isinstance(bots, list):
@@ -63,7 +62,6 @@ def telegram_webhook():
     result = loop.run_until_complete(handle_telegram_update(update))
     return result
 
-# Add a home route so GET / doesn't throw 404
 @app.route("/", methods=["GET"])
 def home():
     return "Telegram Bot API is running!"
