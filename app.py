@@ -19,17 +19,37 @@ async def handle_telegram_update(update):
         if not bots:
             await update.message.reply_text("No bot data available yet. Please add data to Firebase.")
         else:
-            await update.message.reply_text("Hi there! Tell me what kind of Telegram bot you need (e.g., 'Find a translation bot').")
-    elif update.message and update.message.text.lower().startswith('find a '):
-        query = update.message.text.lower().replace('find a ', '').strip()
+            await update.message.reply_text("Hi there! Tell me what kind of Telegram bot you need (e.g., 'Find translation').")
+
+    elif update.message and update.message.text.lower().startswith('find '):
+        query = update.message.text.lower().replace('find ', '').strip()
         bots = ref.get()
+
         if bots:
-            for bot in bots:
-                if bot.get('category') and bot['category'].lower() == query:
-                    response = f"Bot found!\nName: {bot['name']}\nDescription: {bot['description']}\nLink: {bot['link']}\nRating: {bot['rating']}\nTips: {bot['tips']}"
-                    await update.message.reply_text(response)
-                    break
+            # Make sure we always have a list of bot dicts
+            if isinstance(bots, dict):
+                bot_list = bots.values()
+            elif isinstance(bots, list):
+                bot_list = bots
             else:
+                bot_list = []
+
+            found = False
+            for bot in bot_list:
+                if bot.get('category') and query in bot['category'].lower():
+                    response = (
+                        f"Bot found!\n"
+                        f"Name: {bot['name']}\n"
+                        f"Description: {bot['description']}\n"
+                        f"Link: {bot['link']}\n"
+                        f"Rating: {bot['rating']}\n"
+                        f"Tips: {bot['tips']}"
+                    )
+                    await update.message.reply_text(response)
+                    found = True
+                    break
+
+            if not found:
                 await update.message.reply_text("Sorry, no bot found for that category.")
         else:
             await update.message.reply_text("No bot data available yet.")
@@ -42,6 +62,11 @@ def telegram_webhook():
     update = telegram.Update.de_json(request.get_json(), bot)
     result = loop.run_until_complete(handle_telegram_update(update))
     return result
+
+# Add a home route so GET / doesn't throw 404
+@app.route("/", methods=["GET"])
+def home():
+    return "Telegram Bot API is running!"
 
 if __name__ == "__main__":
     with open('telegram_token.txt', 'r') as file:
