@@ -15,7 +15,6 @@ ref = db.reference('bots')
 
 async def handle_telegram_update(update):
     if update.message and update.message.text == '/start':
-        # No hardcoded data; rely on existing Firebase data
         bots = ref.get()
         if not bots:
             await update.message.reply_text("No bot data available yet. Please add data to Firebase.")
