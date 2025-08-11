@@ -1,4 +1,4 @@
 flask==2.3.2
-python-telegram-bot==20.3  # Downgrade to avoid httpx incompatibility
+python-telegram-bot==20.6  # Updated to latest compatible version
 firebase-admin==6.2.0
-httpx==0.23.0  # Pin a compatible httpx version
+httpx==0.24.1  # Updated to match python-telegram-bot's requirement
