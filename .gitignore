@@ -1,0 +1,6 @@
+__pycache__/
+     *.pyc
+     .env
+     firebasekey.json
+     *.log
+     telegram_token.txt

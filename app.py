@@ -1,106 +1,294 @@
-from flask import Flask, request
+import os
+from flask import Flask, request, jsonify
 import telegram
 import asyncio
 import firebase_admin
-from firebase_admin import db
-from transformers import pipeline  # For AI NLP
+from firebase_admin import db, credentials,auth
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import logging
+import requests
+from dotenv import load_dotenv
+
+ 
+# Load Environment Variables
+
+load_dotenv()
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-2")  # default grok-2
+
+if not OPENROUTER_API_KEY:
+    raise ValueError("⚠️ Missing OPENROUTER_API_KEY in .env file")
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("⚠️ Missing TELEGRAM_BOT_TOKEN in .env file")
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
-# Initialize Firebase (local file path)
-cred = firebase_admin.credentials.Certificate('firebasekey.json')
+ 
+# Firebase Initialization
+ 
+cred = credentials.Certificate('firebasekey.json')
 firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://botify-409-default-rtdb.firebaseio.com/'  # Verify URL
+    'databaseURL': 'https://botify-409-default-rtdb.firebaseio.com/'
 })
 ref = db.reference('bots')
+user_searches_ref = db.reference('user_searches')
+favorites_ref = db.reference('user_favorites')
+ratings_ref = db.reference('bot_ratings')
 
-# Initialize AI model (e.g., for intent recognition)
-classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+ 
+# Telegram Bot Initialization
+ 
+bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
-async def handle_telegram_update(update):
-    if update.message and update.message.text == '/start':
-        bots = ref.get()
-        if not bots:
-            await update.message.reply_text("No bot data available yet.")
+# Verify Firebase Token
+def verify_firebase_token(token):
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token['uid']
+    except Exception as e:
+        logging.error(f"Token verification failed: {e}")
+        return None
+ 
+# OpenRouter API
+ 
+def generate_openrouter_response(query):
+    """Fallback: Generate response using OpenRouter API"""
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant that recommends Telegram bots."},
+            {"role": "user", "content": query}
+        ]
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"⚠️ OpenRouter error: {str(e)}"
+
+ 
+# Embedding Model
+ 
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+def get_embedding(text):
+    return model.encode([text])[0].tolist()
+
+ 
+# Telegram Handler
+ 
+async def handle_telegram_update(data):
+    reply_text = "No matching bot found."
+    query = None
+    user_id = None
+
+     # Verify Firebase token if provided
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        user_id = verify_firebase_token(token)
+    if not user_id:
+        user_id = data.get('user_id', 'flutter_user')
+
+    if 'update_id' in data and 'message' in data and 'date' in data.get('message', {}):
+        update = telegram.Update.de_json(data, bot)
+        if update.message and update.message.text:
+            query = update.message.text.lower()
+            user_id = str(update.message.chat.id)
+    elif 'message' in data and 'text' in data.get('message', {}):
+        query = data['message']['text'].lower()
+        user_id = "flutter_user"
+    else:
+        return {"reply": "Invalid request format."}
+
+    # Save search history
+    searches = user_searches_ref.child(user_id).get() or []
+    searches.append(query)
+    user_searches_ref.child(user_id).set(searches[-5:])
+    query = query.strip()
+
+    # Load bot data
+    bots = ref.get() or {}
+    bot_list = list(bots.values()) if isinstance(bots, dict) else bots
+
+    # Precompute embeddings if not cached
+    embeddings_ref = db.reference('bot_embeddings')
+    bot_embeddings = embeddings_ref.get() or {}
+    if not bot_embeddings:
+        for i, bot_data in enumerate(bot_list):
+            if str(i) not in bot_embeddings:
+                bot_embeddings[str(i)] = get_embedding(bot_data.get('description', ''))
+        embeddings_ref.set(bot_embeddings)
+
+    # Keyword Search
+    matching_bots = []
+    for bot_data in bot_list:
+        name = bot_data.get('name', '').lower()
+        description = bot_data.get('description', '').lower()
+        if query in name or query in description:
+            matching_bots.append(bot_data)
+
+    if matching_bots:
+        best_match = matching_bots[0]
+        reply_text = f"Best match: {best_match.get('name', 'Unknown')}\nDescription: {best_match.get('description', 'No description')}\nLink: {best_match.get('link', 'No link')}"
+
+    # Category Filter
+    if query.startswith("/filter"):
+        category = query.replace("/filter", "").strip().lower()
+        filtered_bots = [b for b in bot_list if b.get('category', '').lower() == category]
+        if filtered_bots:
+            reply_text = "Matching bots:\n" + "\n".join(
+                f"{b.get('name', 'Unknown')}\nDescription: {b.get('description', 'No description')}\nLink: {b.get('link', 'No link')}\n"
+                for b in filtered_bots
+            )
         else:
-            await update.message.reply_text("Hi there! Tell me what kind of Telegram bot you need (e.g., 'find translation').")
+            reply_text = f"No bots found in category '{category}'."
 
-    elif update.message and update.message.text.lower().startswith('find '):
-        query = update.message.text.lower().replace('find ', '').strip()
-        # Use AI to classify intent
-        candidate_labels = ["translation", "weather", "news", "games", "music", "education", "shopping", "social", "health"]
-        result = classifier(query, candidate_labels)
-        best_category = result['labels'][0]  # Most likely category
+    # Semantic Search
+    if reply_text == "No matching bot found.":
+        query_embedding = get_embedding(query)
+        similarities = {}
 
-        bots = ref.get()
-        if bots:
-            if isinstance(bots, dict):
-                bot_list = bots.values()
-            elif isinstance(bots, list):
-                bot_list = bots
+        for i, bot_data in enumerate(bot_list):
+            if isinstance(bot_embeddings, dict):
+                embedding = np.array(bot_embeddings.get(str(i), get_embedding(bot_data.get('description', ''))))
+            elif isinstance(bot_embeddings, list):
+                try:
+                    embedding = np.array(bot_embeddings[i])
+                except (IndexError, TypeError):
+                    embedding = np.array(get_embedding(bot_data.get('description', '')))
             else:
-                bot_list = []
-            for bot in bot_list:
-                if bot.get('category') and best_category.lower() in bot['category'].lower():
-                    await update.message.reply_text(f"Bot found!\nName: {bot['name']}\nDescription: {bot['description']}\nLink: {bot['link']}\nRating: {bot['rating']}\nTips: {bot['tips']}")
-                    break
-            else:
-                await update.message.reply_text("Sorry, no bot found for that intent.")
+                embedding = np.array(get_embedding(bot_data.get('description', '')))
+
+            similarity = cosine_similarity([query_embedding], [embedding])[0][0]
+            similarities[i] = similarity
+
+        best_match_idx = max(similarities, key=similarities.get, default=None)
+        if best_match_idx is not None and similarities[best_match_idx] > 0.3:
+            best_match = bot_list[best_match_idx]
+            reply_text = f"Best match: {best_match.get('name', 'Unknown')}\nDescription: {best_match.get('description', 'No description')}\nLink: {best_match.get('link', 'No link')}"
         else:
-            await update.message.reply_text("No bot data available yet.")
-    return "OK"
+            reply_text = generate_openrouter_response(query)
 
+    # Send reply to Telegram (only if it's from Telegram, not Flutter)
+    if 'update_id' in data and user_id:
+        await bot.send_message(chat_id=user_id, text=reply_text)
+
+    return {"reply": reply_text}
+
+ 
+# Favorites API
+ 
+@app.route('/favorite', methods=['POST'])
+def handle_favorite():
+    data = request.get_json()
+    auth_header = request.headers.get('Authorization')
+    user_id = None
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        user_id = verify_firebase_token(token)
+    if not user_id:
+        user_id = data.get('user_id', 'flutter_user')
+
+    bot_name = data.get('bot_name')
+    action = data.get('action')
+
+    favorites = favorites_ref.child(user_id).get() or []
+    bots = ref.get() or {}
+    bot_list = list(bots.values()) if isinstance(bots, dict) else bots
+
+    if action == 'add' and bot_name:
+        bot_data = next((b for b in bot_list if b.get('name') == bot_name), None)
+        if bot_data and bot_name not in [f.get('name') for f in favorites]:
+            favorites.append(bot_data)
+            favorites_ref.child(user_id).set(favorites)
+            return jsonify({"status": "added", "count": len(favorites)})
+    elif action == 'remove' and bot_name:
+        favorites = [f for f in favorites if f.get('name') != bot_name]
+        favorites_ref.child(user_id).set(favorites)
+        return jsonify({"status": "removed", "count": len(favorites)})
+    elif action == 'count':
+        return jsonify({"status": "count", "count": len(favorites)})
+    return jsonify({"status": "no change", "count": len(favorites)})
+
+ 
+# Ratings API
+@app.route('/rate', methods=['POST'])
+def handle_rate():
+    data = request.get_json()
+    auth_header = request.headers.get('Authorization')
+    user_id = None
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ')[1]
+        user_id = verify_firebase_token(token)
+    if not user_id:
+        user_id = data.get('user_id', 'flutter_user')
+
+    bot_name = data.get('bot_name')
+    action = data.get('action')
+    value = data.get('value')
+
+    snapshot = ratings_ref.child(bot_name).get()
+    ratings = {'ratings': [], 'likes': 0, 'liked_by': [], 'avg_rating': 0.0}
+    if snapshot is not None and isinstance(snapshot, dict):
+        ratings.update(snapshot)
+
+    if action == 'rate' and isinstance(value, (int, float)):
+        if 1 <= value <= 5:
+            ratings['ratings'].append(float(value))
+            avg_rating = sum(ratings['ratings']) / len(ratings['ratings'])
+            ratings['avg_rating'] = round(avg_rating, 1)
+            ratings_ref.child(bot_name).update(ratings)
+            return jsonify({"status": "rated", "avg_rating": ratings['avg_rating'], "like_count": ratings['likes']})
+        return jsonify({"status": "invalid", "avg_rating": ratings['avg_rating'], "like_count": ratings['likes']})
+
+    elif action == 'like' and isinstance(value, bool):
+        liked_by = ratings.get('liked_by', [])
+        if value and user_id not in liked_by:
+            ratings['likes'] += 1
+            liked_by.append(user_id)
+        elif not value and user_id in liked_by:
+            ratings['likes'] -= 1
+            liked_by.remove(user_id)
+        ratings['liked_by'] = liked_by
+        ratings_ref.child(bot_name).update(ratings)
+        avg_rating = sum(ratings['ratings']) / len(ratings['ratings']) if ratings['ratings'] else 0.0
+        return jsonify({"status": "liked", "avg_rating": round(avg_rating, 1), "like_count": ratings['likes']})
+
+    elif action == 'get':
+        avg_rating = sum(ratings['ratings']) / len(ratings['ratings']) if ratings['ratings'] else 0.0
+        ratings['avg_rating'] = round(avg_rating, 1)
+        ratings_ref.child(bot_name).update(ratings)
+        return jsonify({"status": "fetched", "avg_rating": ratings['avg_rating'], "like_count": ratings['likes']})
+
+    return jsonify({"status": "no change", "avg_rating": ratings['avg_rating'], "like_count": ratings['likes']})
+
+ 
+# Telegram Webhook
+ 
 @app.route('/telegram', methods=['POST'])
 def telegram_webhook():
-    data = request.get_json(force=True)
+    data = request.get_json()
+    logging.debug(f"Received data: {data}")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    response = loop.run_until_complete(handle_telegram_update(data))
+    return jsonify(response)
 
-    # Case 1: Real Telegram Webhook
-    if "update_id" in data:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        update = telegram.Update.de_json(data, bot)
-        return loop.run_until_complete(handle_telegram_update(update))
-
-    # Case 2: Flutter direct request
-    elif "message" in data and "text" in data["message"]:
-        text = data["message"]["text"]
-
-        if text.lower().startswith("find "):
-            query = text.lower().replace("find ", "").strip()
-            candidate_labels = ["translation", "weather", "news", "games", "music", "education", "shopping", "social", "health"]
-            result = classifier(query, candidate_labels)
-            best_category = result['labels'][0]
-
-            bots = ref.get()
-            if bots:
-                bot_list = bots.values() if isinstance(bots, dict) else bots
-                for bot_info in bot_list:
-                    if bot_info.get('category') and best_category.lower() in bot_info['category'].lower():
-                        return {
-                            "reply": f"Bot found!\nName: {bot_info['name']}\nDescription: {bot_info['description']}\nLink: {bot_info['link']}\nRating: {bot_info['rating']}\nTips: {bot_info['tips']}"
-                        }
-                return {"reply": "Sorry, no bot found for that intent."}
-            else:
-                return {"reply": "No bot data available yet."}
-
-        elif text == "/start":
-            return {"reply": "Hi there! Tell me what kind of Telegram bot you need (e.g., 'find translation')."}
-
-        else:
-            return {"reply": "Command not recognized."}
-
-    # Case 3: Invalid request
-    else:
-        return {"error": "Invalid request format"}, 400
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "Telegram Bot API with AI is running locally!"
-
+ 
+# Main
+ 
 if __name__ == "__main__":
-    with open('telegram_token.txt', 'r') as file:
-        token = file.read().strip()
-    global bot
-    bot = telegram.Bot(token=token)
     app.run(host='0.0.0.0', port=7860)
