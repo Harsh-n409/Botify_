@@ -10,7 +10,7 @@ import numpy as np
 import logging
 import requests
 from dotenv import load_dotenv
-
+import json
  
 # Load Environment Variables
 
@@ -31,7 +31,8 @@ logging.basicConfig(level=logging.DEBUG)
  
 # Firebase Initialization
  
-cred = credentials.Certificate('firebasekey.json')
+cred_dict = json.loads(os.getenv('FIREBASE_CREDENTIALS'))
+cred = credentials.Certificate(cred_dict)
 firebase_admin.initialize_app(cred, {
     'databaseURL': 'https://botify-409-default-rtdb.firebaseio.com/'
 })
