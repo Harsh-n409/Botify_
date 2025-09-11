@@ -1,29 +1,31 @@
 import os
 import json
+import requests
 from flask import Flask, request, jsonify
 import telegram
 import asyncio
 import firebase_admin
 from firebase_admin import db, credentials, auth
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import logging
-import requests
 from dotenv import load_dotenv
 
-# Load Environment Variables (only for local testing)
-if not os.getenv("RENDER"):  # Render sets RENDER=true
+# Load Environment Variables
+if not os.getenv("RENDER"):
     load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "x-ai/grok-2")
 
 if not OPENROUTER_API_KEY:
     raise ValueError("⚠️ Missing OPENROUTER_API_KEY")
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("⚠️ Missing TELEGRAM_BOT_TOKEN")
+if not HF_API_TOKEN:
+    raise ValueError("⚠️ Missing HF_API_TOKEN")
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -47,6 +49,22 @@ ratings_ref = db.reference('bot_ratings')
 # Telegram Bot Initialization
 bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
 
+# Hugging Face Inference API
+HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+HF_HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+
+def get_embedding(text):
+    try:
+        payload = {"inputs": text}
+        response = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload, timeout=10)
+        response.raise_for_status()
+        # Hugging Face API returns a list of embeddings; convert to numpy array
+        embedding = np.array(response.json(), dtype=np.float32)
+        return embedding
+    except Exception as e:
+        logging.error(f"Hugging Face API error: {e}")
+        return np.zeros(384)  # Fallback: return zero vector (dimension of all-MiniLM-L6-v2)
+
 # Verify Firebase Token
 def verify_firebase_token(token):
     try:
@@ -56,7 +74,7 @@ def verify_firebase_token(token):
         logging.error(f"Token verification failed: {e}")
         return None
 
-# OpenRouter API
+# OpenRouter API (unchanged)
 def generate_openrouter_response(query):
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -78,19 +96,13 @@ def generate_openrouter_response(query):
     except Exception as e:
         return f"⚠️ OpenRouter error: {str(e)}"
 
-# Embedding Model
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
-def get_embedding(text):
-    return model.encode([text])[0].tolist()
-
 # Telegram Handler
 async def handle_telegram_update(data):
     reply_text = "No matching bot found."
     query = None
     user_id = None
 
-    # Verify Firebase token if provided
+    # Verify Firebase token
     auth_header = request.headers.get('Authorization')
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
@@ -125,7 +137,7 @@ async def handle_telegram_update(data):
     if not bot_embeddings:
         for i, bot_data in enumerate(bot_list):
             if str(i) not in bot_embeddings:
-                bot_embeddings[str(i)] = get_embedding(bot_data.get('description', ''))
+                bot_embeddings[str(i)] = get_embedding(bot_data.get('description', '')).tolist()
         embeddings_ref.set(bot_embeddings)
 
     # Keyword Search
@@ -178,13 +190,13 @@ async def handle_telegram_update(data):
         else:
             reply_text = generate_openrouter_response(query)
 
-    # Send reply to Telegram (only if it's from Telegram, not Flutter)
+    # Send reply to Telegram
     if 'update_id' in data and user_id:
         await bot.send_message(chat_id=user_id, text=reply_text)
 
     return {"reply": reply_text}
 
-# Favorites API
+# Favorites and Ratings APIs (unchanged)
 @app.route('/favorite', methods=['POST'])
 def handle_favorite():
     data = request.get_json()
@@ -217,7 +229,6 @@ def handle_favorite():
         return jsonify({"status": "count", "count": len(favorites)})
     return jsonify({"status": "no change", "count": len(favorites)})
 
-# Ratings API
 @app.route('/rate', methods=['POST'])
 def handle_rate():
     data = request.get_json()
@@ -289,4 +300,5 @@ def health_check():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
+    logging.info(f"Starting Gunicorn on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
