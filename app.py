@@ -298,6 +298,11 @@ def telegram_webhook():
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
+@app.route("/")
+def home():
+    return "Botify backend is running 🚀"
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     logging.info(f"Starting Gunicorn on port {port}")
