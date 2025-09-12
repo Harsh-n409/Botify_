@@ -1,11 +1,11 @@
 import os
-import json
+import json,base64
 import requests
 from flask import Flask, request, jsonify
 import telegram
 import asyncio
 import firebase_admin
-from firebase_admin import db, credentials, auth
+from firebase_admin import db, credentials, auth, initialize_app
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import logging
@@ -31,15 +31,18 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 # Firebase Initialization
-try:
-    cred_dict = json.loads(os.getenv('FIREBASE_CREDENTIALS'))
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://botify-409-default-rtdb.firebaseio.com/'
-    })
-except Exception as e:
-    logging.error(f"Firebase initialization failed: {e}")
-    raise
+firebase_base64 = os.getenv("FIREBASE_CREDENTIALS")
+
+# Decode back into JSON
+cred_json = base64.b64decode(firebase_base64).decode("utf-8")
+cred_dict = json.loads(cred_json)
+
+# Initialize Firebase
+cred = credentials.Certificate(cred_dict)
+initialize_app(cred, {
+    "databaseURL": "https://botify-409.firebaseio.com/"})
+
+
 
 ref = db.reference('bots')
 user_searches_ref = db.reference('user_searches')
